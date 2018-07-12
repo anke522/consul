@@ -81,8 +81,47 @@ Feature: components / catalog-filter
     ---
     And I see 1 [Model] model
     And I see 1 [Model] model with the port "65535"
+    Then I fill in with yaml
+    ---
+    s: hard drive
+    ---
+    And I see 1 [Model] model with the name "[Model]-1"
+    Then I fill in with yaml
+    ---
+    s: monitor
+    ---
+    And I see 2 [Model] models
   Where:
     -------------------------------------------------
     | Model   | Page     | Url                       |
     | service | node     | /dc-1/nodes/node-0        |
     -------------------------------------------------
+  Scenario:
+    Given 1 datacenter model with the value "dc-1"
+    And 3 service models from yaml
+    ---
+      - Tags: ['one', 'two', 'three']
+      - Tags: ['two', 'three']
+      - Tags: ['three']
+    ---
+    When I visit the services page for yaml
+    ---
+      dc: dc-1
+    ---
+    Then the url should be /dc-1/services
+    Then I see 3 service models
+    Then I fill in with yaml
+    ---
+    s: one
+    ---
+    And I see 1 service model with the name "service-0"
+    Then I fill in with yaml
+    ---
+    s: two
+    ---
+    And I see 2 service models
+    Then I fill in with yaml
+    ---
+    s: three
+    ---
+    And I see 3 service models
