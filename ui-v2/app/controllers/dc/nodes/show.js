@@ -23,6 +23,10 @@ export default Controller.extend(WithFiltering, {
       get(item, 'Service')
         .toLowerCase()
         .indexOf(term) !== -1 ||
+      (get(item, 'Tags') || [])
+        .join('')
+        .toLowerCase()
+        .indexOf(term) !== -1 ||
       get(item, 'Port')
         .toString()
         .toLowerCase()
