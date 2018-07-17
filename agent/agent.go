@@ -208,6 +208,9 @@ type Agent struct {
 
 	// proxyManager is the proxy process manager for managed Connect proxies.
 	proxyManager *proxy.Manager
+
+	// Protects proxy information in the local state from concurrent modification
+	proxyLock sync.Mutex
 }
 
 func New(c *config.RuntimeConfig) (*Agent, error) {
@@ -1616,16 +1619,18 @@ func (a *Agent) purgeService(serviceID string) error {
 type persistedProxy struct {
 	ProxyToken string
 	Proxy      *structs.ConnectManagedProxy
+	FromConfig bool
 }
 
 // persistProxy saves a proxy definition to a JSON file in the data dir
-func (a *Agent) persistProxy(proxy *local.ManagedProxy) error {
+func (a *Agent) persistProxy(proxy *local.ManagedProxy, fromConfig bool) error {
 	proxyPath := filepath.Join(a.config.DataDir, proxyDir,
 		stringHash(proxy.Proxy.ProxyService.ID))
 
 	wrapped := persistedProxy{
 		ProxyToken: proxy.ProxyToken,
 		Proxy:      proxy.Proxy,
+		FromConfig: fromConfig,
 	}
 	encoded, err := json.Marshal(wrapped)
 	if err != nil {
@@ -2076,7 +2081,7 @@ func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
 	return nil
 }
 
-// AddProxy adds a new local Connect Proxy instance to be managed by the agent.
+// addProxyLocked adds a new local Connect Proxy instance to be managed by the agent.
 //
 // It REQUIRES that the service that is being proxied is already present in the
 // local state. Note that this is only used for agent-managed proxies so we can
@@ -2091,7 +2096,7 @@ func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
 // definitions from disk; new proxies must leave it blank to get a new token
 // assigned. We need to restore from disk to enable to continue authenticating
 // running proxies that already had that credential injected.
-func (a *Agent) AddProxy(proxy *structs.ConnectManagedProxy, persist bool,
+func (a *Agent) addProxyLocked(proxy *structs.ConnectManagedProxy, persist, fromConfig bool,
 	restoredProxyToken string) error {
 	// Lookup the target service token in state if there is one.
 	token := a.State.ServiceToken(proxy.TargetServiceID)
@@ -2143,9 +2148,16 @@ func (a *Agent) AddProxy(proxy *structs.ConnectManagedProxy, persist bool,
 
 	// Persist the proxy
 	if persist && a.config.DataDir != "" {
-		return a.persistProxy(proxyState)
+		return a.persistProxy(proxyState, fromConfig)
 	}
 	return nil
+}
+
+func (a *Agent) AddProxy(proxy *structs.ConnectManagedProxy, persist, fromConfig bool,
+	restoredProxyToken string) error {
+	a.proxyLock.Lock()
+	defer a.proxyLock.Unlock()
+	return a.addProxyLocked(proxy, persist, fromConfig, restoredProxyToken)
 }
 
 // resolveProxyCheckAddress returns the best address to use for a TCP check of
@@ -2290,8 +2302,10 @@ func (a *Agent) applyProxyDefaults(proxy *structs.ConnectManagedProxy) error {
 	return nil
 }
 
-// RemoveProxy stops and removes a local proxy instance.
-func (a *Agent) RemoveProxy(proxyID string, persist bool) error {
+// removeProxyLocked stops and removes a local proxy instance.
+//
+// It is assumed that this function is called while holding the proxyLock already
+func (a *Agent) removeProxyLocked(proxyID string, persist bool) error {
 	// Validate proxyID
 	if proxyID == "" {
 		return fmt.Errorf("proxyID missing")
@@ -2314,6 +2328,12 @@ func (a *Agent) RemoveProxy(proxyID string, persist bool) error {
 	}
 
 	return nil
+}
+
+func (a *Agent) RemoveProxy(proxyID string, persist bool) error {
+	a.proxyLock.Lock()
+	defer a.proxyLock.Unlock()
+	return a.removeProxyLocked(proxyID, persist)
 }
 
 // verifyProxyToken takes a token and attempts to verify it against the
@@ -2785,6 +2805,56 @@ func (a *Agent) unloadChecks() error {
 // loadProxies will load connect proxy definitions from configuration and
 // persisted definitions on disk, and load them into the local agent.
 func (a *Agent) loadProxies(conf *config.RuntimeConfig) error {
+	persistedProxies := make(map[string]persistedProxy)
+	a.proxyLock.Lock()
+	defer a.proxyLock.Unlock()
+
+	// Load any persisted proxies
+	proxyDir := filepath.Join(a.config.DataDir, proxyDir)
+	files, err := ioutil.ReadDir(proxyDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("Failed reading proxies dir %q: %s", proxyDir, err)
+		}
+	} else {
+		for _, fi := range files {
+			// Skip all dirs
+			if fi.IsDir() {
+				continue
+			}
+
+			// Skip all partially written temporary files
+			if strings.HasSuffix(fi.Name(), "tmp") {
+				a.logger.Printf("[WARN] agent: Ignoring temporary proxy file %v", fi.Name())
+				continue
+			}
+
+			// Open the file for reading
+			file := filepath.Join(proxyDir, fi.Name())
+			fh, err := os.Open(file)
+			if err != nil {
+				return fmt.Errorf("failed opening proxy file %q: %s", file, err)
+			}
+
+			// Read the contents into a buffer
+			buf, err := ioutil.ReadAll(fh)
+			fh.Close()
+			if err != nil {
+				return fmt.Errorf("failed reading proxy file %q: %s", file, err)
+			}
+
+			// Try decoding the proxy definition
+			var p persistedProxy
+			if err := json.Unmarshal(buf, &p); err != nil {
+				a.logger.Printf("[ERR] agent: Failed decoding proxy file %q: %s", file, err)
+				continue
+			}
+			svcID := p.Proxy.TargetServiceID
+
+			persistedProxies[svcID] = p
+		}
+	}
+
 	for _, svc := range conf.Services {
 		if svc.Connect != nil {
 			proxy, err := svc.ConnectManagedProxy()
@@ -2794,78 +2864,47 @@ func (a *Agent) loadProxies(conf *config.RuntimeConfig) error {
 			if proxy == nil {
 				continue
 			}
-			if err := a.AddProxy(proxy, false, ""); err != nil {
+			restoredToken := ""
+			fmt.Printf("cfg proxy: %#v\n", proxy)
+			if persisted, ok := persistedProxies[proxy.TargetServiceID]; ok {
+				restoredToken = persisted.ProxyToken
+			}
+
+			if err := a.addProxyLocked(proxy, true, true, restoredToken); err != nil {
 				return fmt.Errorf("failed adding proxy: %s", err)
 			}
 		}
 	}
 
-	// Load any persisted proxies
-	proxyDir := filepath.Join(a.config.DataDir, proxyDir)
-	files, err := ioutil.ReadDir(proxyDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("Failed reading proxies dir %q: %s", proxyDir, err)
-	}
-	for _, fi := range files {
-		// Skip all dirs
-		if fi.IsDir() {
-			continue
-		}
-
-		// Skip all partially written temporary files
-		if strings.HasSuffix(fi.Name(), "tmp") {
-			a.logger.Printf("[WARN] agent: Ignoring temporary proxy file %v", fi.Name())
-			continue
-		}
-
-		// Open the file for reading
-		file := filepath.Join(proxyDir, fi.Name())
-		fh, err := os.Open(file)
-		if err != nil {
-			return fmt.Errorf("failed opening proxy file %q: %s", file, err)
-		}
-
-		// Read the contents into a buffer
-		buf, err := ioutil.ReadAll(fh)
-		fh.Close()
-		if err != nil {
-			return fmt.Errorf("failed reading proxy file %q: %s", file, err)
-		}
-
-		// Try decoding the proxy definition
-		var p persistedProxy
-		if err := json.Unmarshal(buf, &p); err != nil {
-			a.logger.Printf("[ERR] agent: Failed decoding proxy file %q: %s", file, err)
-			continue
-		}
-		proxyID := p.Proxy.ProxyService.ID
-
-		if a.State.Proxy(proxyID) != nil {
-			// Purge previously persisted proxy. This allows config to be preferred
-			// over services persisted from the API.
-			a.logger.Printf("[DEBUG] agent: proxy %q exists, not restoring from %q",
-				proxyID, file)
+	for _, persisted := range persistedProxies {
+		proxyID := persisted.Proxy.ProxyService.ID
+		if persisted.FromConfig && a.State.Proxy(proxyID) == nil {
+			// Purge proxies that were configured previously but are no longer in the config
+			a.logger.Printf("[DEBUG] agent: purging stale persisted proxy %q", proxyID)
 			if err := a.purgeProxy(proxyID); err != nil {
-				return fmt.Errorf("failed purging proxy %q: %s", proxyID, err)
+				return fmt.Errorf("failed purging proxy %q: %v", proxyID, err)
 			}
-		} else {
-			a.logger.Printf("[DEBUG] agent: restored proxy definition %q from %q",
-				proxyID, file)
-			if err := a.AddProxy(p.Proxy, false, p.ProxyToken); err != nil {
-				return fmt.Errorf("failed adding proxy %q: %s", proxyID, err)
+		} else if !persisted.FromConfig {
+			if a.State.Proxy(proxyID) == nil {
+				a.logger.Printf("[DEBUG] agent: restored proxy definition %q", proxyID)
+				if err := a.addProxyLocked(persisted.Proxy, false, false, persisted.ProxyToken); err != nil {
+					return fmt.Errorf("failed adding proxy %q: %v", proxyID, err)
+				}
+			} else {
+				a.logger.Printf("[WARN] agent: proxy definition %q was overwritten by a proxy definition within a config file", proxyID)
 			}
 		}
 	}
+
 	return nil
 }
 
 // unloadProxies will deregister all proxies known to the local agent.
 func (a *Agent) unloadProxies() error {
+	a.proxyLock.Lock()
+	defer a.proxyLock.Unlock()
 	for id := range a.State.Proxies() {
-		if err := a.RemoveProxy(id, false); err != nil {
+		if err := a.removeProxyLocked(id, false); err != nil {
 			return fmt.Errorf("Failed deregistering proxy '%s': %s", id, err)
 		}
 	}
